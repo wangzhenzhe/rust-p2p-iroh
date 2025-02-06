@@ -8,6 +8,7 @@ anyhow = "1.0.95"
 clap = { version = "4.5.28", features = ["derive"] }
 iroh = "0.32.1"
 iroh-base = "0.32.0"
+lazy_static = "1.5.0"
 rand = "0.8"
 tokio = "1.43.0"
 tracing = "0.1.41"
