@@ -5,34 +5,32 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use iroh::{Endpoint, NodeAddr, PublicKey, SecretKey};
-use tokio::sync::{mpsc, broadcast, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn, error};
 
 const P2P_ALPN: &[u8] = b"P2P_PROTO_V1";
 
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub from: PublicKey,
-    pub payload: Vec<u8>,
-}
-
 #[derive(Debug)]
 struct PeerConnection {
-    #[allow(dead_code)]  // 显式标记此字段是有意保留的
-    connection: iroh::endpoint::Connection,  // 保持连接活跃
+    #[allow(dead_code)]
+    connection: iroh::endpoint::Connection,
     send_stream: Arc<tokio::sync::Mutex<iroh::endpoint::SendStream>>,
 }
 
 impl PeerConnection {
-    // 添加一个方法来检查连接状态
+    /// 检查连接是否仍然存活
+    /// 
+    /// 通过尝试发送空数据包来检测连接状态
+    /// 
+    /// 返回值:
+    /// - true: 连接正常
+    /// - false: 连接已断开
     async fn is_alive(&self) -> bool {
-        // 尝试发送一个心跳消息
         let mut send_guard = match self.send_stream.try_lock() {
             Ok(guard) => guard,
-            Err(_) => return true, // 如果有其他任务正在使用send_stream，说明连接还活着
+            Err(_) => return true,
         };
 
-        // 尝试发送一个空消息来检查连接
         match send_guard.write_all(&[]).await {
             Ok(_) => true,
             Err(_) => false,
@@ -45,15 +43,21 @@ pub struct P2PNode {
     endpoint: Arc<Endpoint>,
     public_key: PublicKey,
     connections: Arc<RwLock<HashMap<PublicKey, PeerConnection>>>,
-    message_tx: broadcast::Sender<Message>,
 }
 
 impl P2PNode {
+    /// 创建新的 P2P 节点实例
+    /// 
+    /// 参数:
+    /// - secret_key: 可选的节点密钥，如果不提供则自动生成
+    /// 
+    /// 返回:
+    /// - Result<Self>: 成功则返回节点实例，失败则返回错误
     pub async fn new(secret_key: Option<SecretKey>) -> Result<Self> {
         let secret_key = secret_key.unwrap_or_else(|| SecretKey::generate(rand::rngs::OsRng));
         let public_key = secret_key.public();
         
-        info!("创建新节点公钥: {}", public_key);
+        info!("正在创建新节点，公钥为: {}", public_key);
         
         let endpoint = Arc::new(
             Endpoint::builder()
@@ -64,26 +68,32 @@ impl P2PNode {
                 .await?
         );
 
-        let (message_tx, _) = broadcast::channel(100);
-
         Ok(Self {
             endpoint,
             public_key,
             connections: Arc::new(RwLock::new(HashMap::new())),
-            message_tx,
         })
     }
 
-    pub async fn start_listening(&self) -> Result<()> {
-        info!("等待中继节点连接...");
+    /// 开始监听传入的连接请求
+    /// 
+    /// 参数:
+    /// - on_receive: 消息处理回调函数，当收到消息时被调用
+    /// 
+    /// 该函数会启动一个后台任务持续监听新的连接
+    pub async fn start_listening<F, Fut>(&self, on_receive: F) -> Result<()> 
+    where
+        F: Fn(PublicKey, Vec<u8>) -> Fut + Send + Clone + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        info!("等待中继连接...");
         self.wait_for_relay().await?;
         
         let addr = self.endpoint.node_addr().await?;
-        info!("节点ID: {}", addr.node_id);
+        info!("节点 ID: {}", addr.node_id);
         info!("监听地址: {:#?}", addr);
         
         let connections = self.connections.clone();
-        let message_tx = self.message_tx.clone();
         let endpoint = self.endpoint.clone();
 
         tokio::spawn(async move {
@@ -91,10 +101,10 @@ impl P2PNode {
             while let Some(incoming) = endpoint.accept().await {
                 info!("收到新的连接请求");
                 let connections = connections.clone();
-                let message_tx = message_tx.clone();
+                let on_receive = on_receive.clone();
                 
                 tokio::spawn(async move {
-                    if let Err(e) = Self::handle_incoming(incoming, connections, message_tx).await {
+                    if let Err(e) = Self::handle_incoming(incoming, connections, on_receive).await {
                         error!("处理连接时出错: {:?}", e);
                     }
                 });
@@ -104,16 +114,32 @@ impl P2PNode {
         Ok(())
     }
 
-    async fn handle_incoming(
+    /// 处理新建立的连接
+    /// 
+    /// 参数:
+    /// - incoming: 传入的连接请求
+    /// - connections: 连接管理器
+    /// - on_receive: 消息处理回调函数
+    /// 
+    /// 该函数负责:
+    /// 1. 验证连接协议
+    /// 2. 建立双向数据流
+    /// 3. 保存连接信息
+    /// 4. 启动消息接收循环
+    async fn handle_incoming<F, Fut>(
         incoming: iroh::endpoint::Incoming,
         connections: Arc<RwLock<HashMap<PublicKey, PeerConnection>>>,
-        message_tx: broadcast::Sender<Message>,
-    ) -> Result<()> {
+        on_receive: F,
+    ) -> Result<()>
+    where
+        F: Fn(PublicKey, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let connection = incoming.await?;
         let alpn = connection.alpn().unwrap();
         
         if alpn != P2P_ALPN.to_vec() {
-            warn!("未知的ALPN协议: {:?}", alpn);
+            warn!("未知的 ALPN 协议: {:?}", alpn);
             return Ok(());
         }
 
@@ -121,14 +147,13 @@ impl P2PNode {
         info!("接受来自 {} 的连接", remote_id);
 
         let (send, mut recv) = connection.accept_bi().await?;
-        info!("建立双向流成功");
+        info!("已建立双向流");
         
-        // 发送一个初始消息
-        let mut send = Arc::new(tokio::sync::Mutex::new(send));
+        let send = Arc::new(tokio::sync::Mutex::new(send));
         {
             let mut send_guard = send.lock().await;
             if let Err(e) = send_guard.write_all(b"CONNECTED\n").await {
-                error!("发送初始消息失败: {:?}", e);
+                error!("Failed to send initial message: {:?}", e);
             }
             send_guard.flush().await?;
         }
@@ -139,32 +164,26 @@ impl P2PNode {
                 connection,
                 send_stream: send,
             });
-            info!("保存连接信息成功，当前连接数: {}", conns.len());
+            info!("Connection info saved, current connections: {}", conns.len());
         }
 
-        // 处理接收到的消息
+        let on_receive = Arc::new(on_receive);
+        let remote_id = remote_id;
+        
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             loop {
                 match recv.read(&mut buf).await {
                     Ok(Some(0)) => {
-                        info!("连接关闭");
+                        info!("连接已关闭");
                         break;
                     }
                     Ok(Some(n)) => {
                         info!("收到 {} 字节的消息", n);
-                        if let Err(e) = message_tx
-                            .send(Message {
-                                from: remote_id,
-                                payload: buf[..n].to_vec(),
-                            })
-                        {
-                            error!("发送消息到channel失败: {:?}", e);
-                            break;
-                        }
+                        on_receive(remote_id, buf[..n].to_vec()).await;
                     }
                     Ok(None) => {
-                        info!("流结束");
+                        info!("流已结束");
                         break;
                     }
                     Err(e) => {
@@ -179,8 +198,23 @@ impl P2PNode {
         Ok(())
     }
 
-    pub async fn connect(&self, addr: NodeAddr) -> Result<()> {
-        info!("开始连接到节点: {:?}", addr);
+    /// 主动连接到远程节点
+    /// 
+    /// 参数:
+    /// - addr: 目标节点地址
+    /// - on_receive: 消息处理回调函数
+    /// 
+    /// 该函数会:
+    /// 1. 建立连接
+    /// 2. 初始化双向数据流
+    /// 3. 保存连接信息
+    /// 4. 启动消息接收循环
+    pub async fn connect<F, Fut>(&self, addr: NodeAddr, on_receive: F) -> Result<()>
+    where
+        F: Fn(PublicKey, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        info!("正在开始连接到节点: {:?}", addr);
         
         let connection = self
             .endpoint
@@ -188,12 +222,11 @@ impl P2PNode {
             .await?;
             
         let remote_id = connection.remote_node_id()?;
-        info!("连接成功远程节点ID: {}", remote_id);
+        info!("成功连接到远程节点 ID: {}", remote_id);
         
         let (send, mut recv) = connection.open_bi().await?;
-        info!("建立双向流成功");
+        info!("已建立双向流");
 
-        // 发送一个初始消息
         let send = Arc::new(tokio::sync::Mutex::new(send));
         {
             let mut send_guard = send.lock().await;
@@ -209,34 +242,26 @@ impl P2PNode {
                 connection,
                 send_stream: send,
             });
-            info!("保存连接信息成功，当前连接数: {}", conns.len());
+            info!("连接信息已保存，当前连接数: {}", conns.len());
         }
 
-        let message_tx = self.message_tx.clone();
+        let on_receive = Arc::new(on_receive);
+        let remote_id = remote_id;
         
-        // 处理接收到的消息
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             loop {
                 match recv.read(&mut buf).await {
                     Ok(Some(0)) => {
-                        info!("连接关闭");
+                        info!("连接已关闭");
                         break;
                     }
                     Ok(Some(n)) => {
                         info!("收到 {} 字节的消息", n);
-                        if let Err(e) = message_tx
-                            .send(Message {
-                                from: remote_id,
-                                payload: buf[..n].to_vec(),
-                            })
-                        {
-                            error!("发送消息到channel失败: {:?}", e);
-                            break;
-                        }
+                        on_receive(remote_id, buf[..n].to_vec()).await;
                     }
                     Ok(None) => {
-                        info!("流结束");
+                        info!("流已结束");
                         break;
                     }
                     Err(e) => {
@@ -251,10 +276,19 @@ impl P2PNode {
         Ok(())
     }
 
+    /// 向指定节点发送消息
+    /// 
+    /// 参数:
+    /// - to: 目标节点的公钥
+    /// - payload: 要发送的消息内容
+    /// 
+    /// 返回:
+    /// - Ok(()): 发送成功
+    /// - Err: 发送失败（可能是连接不存在或已断开）
     pub async fn send_message(&self, to: PublicKey, payload: Vec<u8>) -> Result<()> {
         let connections = self.connections.read().await;
         if let Some(peer) = connections.get(&to) {
-            info!("发送消息到 {}", to);
+            info!("正在发送消息给 {}", to);
             let mut send_guard = peer.send_stream.lock().await;
             send_guard.write_all(&payload).await?;
             send_guard.write_all(b"\n").await?;
@@ -263,30 +297,33 @@ impl P2PNode {
             Ok(())
         } else {
             error!("未找到与节点 {} 的连接", to);
-            Err(anyhow::anyhow!("未找到与目标节点的连接"))
+            Err(anyhow::anyhow!("未找到目标节点的连接"))
         }
     }
 
-    pub fn receive_messages(&self) -> broadcast::Receiver<Message> {
-        info!("获取消息接收通道");
-        self.message_tx.subscribe()
-    }
-
+    /// 主动断开与指定节点的连接
+    /// 
+    /// 参数:
+    /// - peer: 要断开连接的节点公钥
     pub async fn disconnect(&self, peer: PublicKey) -> Result<()> {
         let mut connections = self.connections.write().await;
         if connections.remove(&peer).is_some() {
-            info!("断开与节点 {} 的连接", peer);
+            info!("已断开与节点 {} 的连接", peer);
         }
         Ok(())
     }
 
+    /// 关闭所有连接并清理资源
     pub async fn shutdown(&self) -> Result<()> {
         let mut connections = self.connections.write().await;
-        info!("关闭所有连接，当前连接数: {}", connections.len());
+        info!("正在关闭所有连接，当前连接数: {}", connections.len());
         connections.clear();
         Ok(())
     }
 
+    /// 等待中继服务器初始化完成
+    /// 
+    /// 在节点开始工作之前确保中继服务可用
     async fn wait_for_relay(&self) -> Result<()> {
         info!("等待中继服务器初始化...");
         let relay = self.endpoint.home_relay().initialized().await?;
@@ -294,21 +331,34 @@ impl P2PNode {
         Ok(())
     }
 
+    /// 获取当前节点的公钥标识
     pub fn get_node_id(&self) -> PublicKey {
         self.public_key
     }
 
+    /// 获取当前节点的网络地址
     pub async fn get_node_addr(&self) -> Result<NodeAddr> {
         self.endpoint.node_addr().await
     }
 
+    /// 获取当前所有已连接节点的列表
+    /// 
+    /// 返回所有已连接节点的公钥列表
     pub async fn get_connections(&self) -> Vec<PublicKey> {
         let connections = self.connections.read().await;
         let peers = connections.keys().cloned().collect();
-        info!("当前连接的节点: {:?}", peers);
+        info!("当前已连接的节点: {:?}", peers);
         peers
     }
 
+    /// 检查与指定节点的连接状态
+    /// 
+    /// 参数:
+    /// - peer: 要检查的节点公钥
+    /// 
+    /// 返回:
+    /// - Ok(true): 连接正常
+    /// - Ok(false): 连接不存在或已断开
     pub async fn check_connection(&self, peer: PublicKey) -> Result<bool> {
         let connections = self.connections.read().await;
         if let Some(peer_conn) = connections.get(&peer) {
@@ -318,6 +368,9 @@ impl P2PNode {
         }
     }
 
+    /// 清理所有已断开的连接
+    /// 
+    /// 定期调用此函数可以清理无效连接，释放资源
     pub async fn cleanup_dead_connections(&self) -> Result<()> {
         let mut connections = self.connections.write().await;
         let mut dead_peers = Vec::new();
@@ -330,7 +383,7 @@ impl P2PNode {
         
         for peer in dead_peers {
             connections.remove(&peer);
-            info!("移除断开的连接: {}", peer);
+            info!("已移除断开连接的节点: {}", peer);
         }
         
         Ok(())
